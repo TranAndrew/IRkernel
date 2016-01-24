@@ -5,12 +5,6 @@ setClassUnion('recordedplotOrNULL', members = c('recordedplot', 'NULL'))
 
 displayenv <- environment(publish_mimebundle)
 
-lappend <- function(lst, obj) {
-    # I hope this isn't the best way to do this.
-    lst[[length(lst) + 1L]] <- obj
-    lst
-}
-
 # create an empty named list
 namedlist <- function() setNames(list(), character(0))
 
@@ -35,6 +29,34 @@ ask <- function(prompt = '') {
            NA)
     }
     answer
+}
+
+format_stack <- function(calls) {
+    line_refs <- rep('', length(calls))
+    
+    tb <- lapply(seq_along(calls), function(cl) {
+        call <- calls[[cl]]
+        
+        # first_line, first_byte, last_line, last_byte, first_column, last_column, first_parsed, last_parsed
+        ref <- attr(call, 'srcref')
+        
+        filename <- attr(ref, 'srcfile')$filename
+        
+        if (!is.null(ref)) {
+            f <- ref[[1]]
+            l <- ref[[3]]
+            lines <- if (f == l) f else paste0(f, '-', l)
+            line_refs[[cl]] <<- paste0('   # at line ', lines, ' of file ', filename)
+        }
+        
+        white <- paste(rep(' ', nchar(format(cl))), collapse = '')
+        
+        f.call <- format(call)
+        line.prefix <- c(cl, rep(white, length(f.call) - 1))
+        paste(paste0(line.prefix, '. ', f.call), collapse = '\n')
+    })
+    
+    paste0(tb, line_refs)
 }
 
 Executor <- setRefClass(
@@ -84,7 +106,7 @@ execute = function(request) {
         }
         if (delete.file) file.remove(files)
         mimebundle <- list('text/plain' = paste(text, collapse = '\n'))
-        payload <<- lappend(payload, list(source = 'page', data = mimebundle))
+        payload <<- c(payload, list(list(source = 'page', data = mimebundle)))
     })
     
     # .Last doesn’t seem to work, so replicating behavior
@@ -100,7 +122,7 @@ execute = function(request) {
             if (!is.null(.GlobalEnv$.Last.sys)) .GlobalEnv$.Last.sys()
         }
         if (save) NULL  # TODO: actually save history
-        payload <<- lappend(payload, list(source = 'ask_exit'))
+        payload <<- c(payload, list(list(source = 'ask_exit')))
     }
     
     # shade base::quit
@@ -124,9 +146,19 @@ execute = function(request) {
     }
     
     err <<- list()
+    nframe <- NULL  # find out stack depth in notebook cell
+    tryCatch(evaluate(
+        'stop()',
+        stop_on_error = 1L,
+        output_handler = new_output_handler(error = function(e) nframe <<- sys.nframe())))
     
     handle_error <- function(e) {
-        err <<- list(ename = 'ERROR', evalue = toString(e), traceback = list(toString(e)))
+        calls <- head(sys.calls()[-seq_len(nframe + 1L)], -3)
+        
+        msg <- paste0(toString(e), 'Traceback:\n')
+        stack_info <- format_stack(calls)
+        
+        err <<- list(ename = 'ERROR', evalue = toString(e), traceback = c(msg, stack_info))
         if (!silent) {
             send_response('error', request, 'iopub', c(err, list(
                 execution_count = execution_count)))
@@ -201,7 +233,7 @@ execute = function(request) {
             request$content$code,
             envir = .GlobalEnv,
             output_handler = oh,
-            stop_on_error = 0L),
+            stop_on_error = 1L),
         interrupt = function(cond) interrupted <<- TRUE,
         error = handle_error) # evaluate does not catch errors in parsing
     

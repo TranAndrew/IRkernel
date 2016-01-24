@@ -1,4 +1,4 @@
-#' @include execution.r
+#' @include execution.r help.r
 NULL
 
 fromRawJSON <- function(r) {
@@ -14,7 +14,7 @@ fromRawJSON <- function(r) {
 #' @export
 Kernel <- setRefClass(
     'Kernel',
-    fields  = list(
+    fields = list(
         connection_info = 'list',
         zmqctx          = 'externalptr',
         sockets         = 'list',
@@ -22,8 +22,8 @@ Kernel <- setRefClass(
     methods = list(
 
 hb_reply = function() {
-    data <- receive.socket(sockets$hb, unserialize = FALSE)
-    send.socket(sockets$hb, data, serialize = FALSE)
+    data <- zmq.msg.recv(sockets$hb, unserialize = FALSE)
+    zmq.msg.send(data, sockets$hb, serialize = FALSE)
 },
 
 sign_msg = function(msg_lst) {
@@ -37,7 +37,7 @@ wire_to_msg = function(parts) {
     "Deserialize a message"
     
     i <- 1
-    #print(parts)
+    #print(lapply(parts, function(r) tryCatch(rawToChar(r), error = function(r) r)))
     while (!identical(parts[[i]], charToRaw('<IDS|MSG>'))) {
         i <- i + 1
     }
@@ -110,13 +110,13 @@ send_response = function(msg_type, parent_msg, socket_name, content) {
     msg <- new_reply(msg_type, parent_msg)
     msg$content <- content
     socket <- sockets[[socket_name]]
-    send.multipart(socket, msg_to_wire(msg))
+    zmq.send.multipart(socket, msg_to_wire(msg), serialize = FALSE)
 },
 
 handle_shell = function() {
     "React to a shell message coming in"
     
-    parts <- receive.multipart(sockets$shell)
+    parts <- zmq.recv.multipart(sockets$shell, unserialize = FALSE)
     msg <- wire_to_msg(parts)
     switch(
         msg$header$msg_type,
@@ -227,7 +227,7 @@ kernel_info = function(request) {
 },
 
 handle_control = function() {
-    parts <- receive.multipart(sockets$control)
+    parts <- zmq.recv.multipart(sockets$control, unserialize = FALSE)
     msg <- wire_to_msg(parts)
     if (msg$header$msg_type == 'shutdown_request') {
         shutdown(msg)
@@ -251,42 +251,38 @@ initialize = function(connection_file) {
     }
     
     # ZMQ Socket setup
-    zmqctx <<- init.context()
+    zmqctx <<- zmq.ctx.new()
     sockets <<- list(
-        hb      = init.socket(zmqctx, 'ZMQ_REP'),
-        iopub   = init.socket(zmqctx, 'ZMQ_PUB'),
-        control = init.socket(zmqctx, 'ZMQ_ROUTER'),
-        stdin   = init.socket(zmqctx, 'ZMQ_ROUTER'),
-        shell   = init.socket(zmqctx, 'ZMQ_ROUTER'))
+        hb      = zmq.socket(zmqctx, .pbd_env$ZMQ.ST$REP),
+        iopub   = zmq.socket(zmqctx, .pbd_env$ZMQ.ST$PUB),
+        control = zmq.socket(zmqctx, .pbd_env$ZMQ.ST$ROUTER),
+        stdin   = zmq.socket(zmqctx, .pbd_env$ZMQ.ST$ROUTER),
+        shell   = zmq.socket(zmqctx, .pbd_env$ZMQ.ST$ROUTER))
     
-    bind.socket(sockets$hb,      url_with_port('hb_port'))
-    bind.socket(sockets$iopub,   url_with_port('iopub_port'))
-    bind.socket(sockets$control, url_with_port('control_port'))
-    bind.socket(sockets$stdin,   url_with_port('stdin_port'))
-    bind.socket(sockets$shell,   url_with_port('shell_port'))
+    zmq.bind(sockets$hb,      url_with_port('hb_port'))
+    zmq.bind(sockets$iopub,   url_with_port('iopub_port'))
+    zmq.bind(sockets$control, url_with_port('control_port'))
+    zmq.bind(sockets$stdin,   url_with_port('stdin_port'))
+    zmq.bind(sockets$shell,   url_with_port('shell_port'))
     
     executor <<- Executor$new(send_response = .self$send_response)
 },
 
 run = function() {
     while (TRUE) {
-        events <- poll.socket(
-            list(sockets$hb, sockets$shell, sockets$control),
-            list('read', 'read', 'read'), timeout = -1L)
+        zmq.poll(
+            c(sockets$hb, sockets$shell, sockets$control),
+            rep(.pbd_env$ZMQ.PO$POLLIN, 3))
         
-        if (events[[1]]$read) {
-            # heartbeat
+        if(bitwAnd(zmq.poll.get.revents(1), .pbd_env$ZMQ.PO$POLLIN))
             hb_reply()
-        }
         
-        if (events[[2]]$read) {
-            # Shell socket
+        if(bitwAnd(zmq.poll.get.revents(2), .pbd_env$ZMQ.PO$POLLIN))
             handle_shell()
-        }
         
-        if (events[[3]]$read) {  # Control socket
+        if(bitwAnd(zmq.poll.get.revents(3), .pbd_env$ZMQ.PO$POLLIN))
             handle_control()
-        }
+        
     }
 })
 )
@@ -305,42 +301,4 @@ main <- function(connection_file = '') {
     }
     kernel <- Kernel$new(connection_file = connection_file)
     kernel$run()
-}
-
-#' Install the kernelspec to tell Jupyter (or IPython ≥ 3) about IRkernel.
-#'
-#' Will use jupyter and its config directory if available, but fall back to ipython if not.
-#'
-#' @param user Install into user directory (~/.jupyter or ~/.ipython) or globally?
-#' 
-#' @export
-installspec <- function(user = TRUE) {
-    found_binary <- FALSE
-    for (binary in c('jupyter', 'ipython', 'ipython3', 'ipython2')) {
-        version <- tryCatch(system2(binary, '--version', TRUE, FALSE), error = function(e) '0.0.0')
-        if (compareVersion(version, '3.0.0') >= 0) {
-            found_binary <- TRUE
-            break
-        }
-    }
-    
-    if (!found_binary)
-        stop('Jupyter or IPython 3.0 has to be installed but could neither run “jupyter” nor “ipython”, “ipython2” or “ipython3”.
-             (Note that “ipython2” is just IPython for Python 2, but still may be IPython 3.0)')
-    
-    # make a kernelspec with the current interpreter's absolute path
-    srcdir <- system.file('kernelspec', package = 'IRkernel')
-    tmp_name <- tempfile()
-    dir.create(tmp_name)
-    file.copy(srcdir, tmp_name, recursive = TRUE)
-    spec_path <- file.path(tmp_name, 'kernelspec', 'kernel.json')
-    spec <- fromJSON(spec_path)
-    spec$argv[[1]] <- file.path(R.home('bin'), 'R')
-    write(toJSON(spec, pretty = TRUE, auto_unbox = TRUE), file = spec_path)
-
-    user_flag <- if (user) '--user' else character(0)
-    args <- c('kernelspec', 'install', '--replace', '--name', 'ir', user_flag, file.path(tmp_name, 'kernelspec'))
-    system2(binary, args, wait = TRUE)
-
-    unlink(tmp_name, recursive = TRUE)
 }

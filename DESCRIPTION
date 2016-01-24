@@ -21,7 +21,7 @@ Imports:
     methods,
     evaluate (>= 0.5.4),
     IRdisplay,
-    rzmq (>= 0.7.0),
+    pbdZMQ (>= 0.2.1),
     jsonlite (>= 0.9.6),
     uuid,
     digest
@@ -29,5 +29,6 @@ Collate:
     'options.r'
     'execution.r'
     'help.r'
+    'installspec.r'
     'kernel.r'
 RoxygenNote: 5.0.1
