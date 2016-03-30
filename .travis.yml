@@ -14,13 +14,14 @@ install:
 
   # Replace dep1 dep2 ... with your dependencies
   - conda create -q -n test-environment -c r r r-uuid r-digest r-base64enc
-            r-evaluate r-jsonlite jupyter pip zeromq=4.0* r-rzmq nose
+            r-evaluate r-jsonlite jupyter pip zeromq nose
   - source activate test-environment
   - pip install jupyter_kernel_test
-  - R -e "install.packages(c('repr','IRdisplay'),
-            repos = 'http://irkernel.github.io/')"
+  - R -e "withCallingHandlers(install.packages('pbdZMQ', repos = 'http://cran.rstudio.com/'), warning = stop)"
+  - R -e "withCallingHandlers(install.packages(c('repr','IRdisplay'), repos = 'http://irkernel.github.io/'), warning = stop)"
   - R CMD INSTALL $TRAVIS_BUILD_DIR
   - R -e "IRkernel::installspec()"
+  - R -e "IRkernel::installspec(name='testir', displayname='testir')"
 
 script:
   - python test_ir.py

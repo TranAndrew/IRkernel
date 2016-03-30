@@ -1,4 +1,4 @@
-#' @include execution.r help.r
+#' @include execution.r help.r comm_manager.r logging.r
 NULL
 
 fromRawJSON <- function(r) {
@@ -6,6 +6,7 @@ fromRawJSON <- function(r) {
     Encoding(s) <- 'UTF-8'
     fromJSON(s)
 }
+
 
 #' The kernel
 #' 
@@ -18,7 +19,8 @@ Kernel <- setRefClass(
         connection_info = 'list',
         zmqctx          = 'externalptr',
         sockets         = 'list',
-        executor        = 'Executor'),
+        executor        = 'Executor',
+        comm_manager    = 'Comm_Manager'),
     methods = list(
 
 hb_reply = function() {
@@ -37,7 +39,6 @@ wire_to_msg = function(parts) {
     "Deserialize a message"
     
     i <- 1
-    #print(lapply(parts, function(r) tryCatch(rawToChar(r), error = function(r) r)))
     while (!identical(parts[[i]], charToRaw('<IDS|MSG>'))) {
         i <- i + 1
     }
@@ -71,7 +72,6 @@ wire_to_msg = function(parts) {
 msg_to_wire = function(msg) {
     "Serialize a message"
     
-    #print(msg)
     bodyparts <- list(
         charToRaw(toJSON(msg$header,        auto_unbox = TRUE)),
         charToRaw(toJSON(msg$parent_header, auto_unbox = TRUE)),
@@ -91,7 +91,7 @@ new_reply = function(msg_type, parent_msg) {
     
     header <- list(
         msg_id   = UUIDgenerate(),
-        username = parent_msg$header$username, 
+        username = parent_msg$header$username,
         session  = parent_msg$header$session,
         msg_type = msg_type,
         version  = '5.0')
@@ -111,6 +111,7 @@ send_response = function(msg_type, parent_msg, socket_name, content) {
     msg$content <- content
     socket <- sockets[[socket_name]]
     zmq.send.multipart(socket, msg_to_wire(msg), serialize = FALSE)
+    log_debug('Sending msg %s', msg$header$msg_type)
 },
 
 handle_shell = function() {
@@ -120,6 +121,10 @@ handle_shell = function() {
     msg <- wire_to_msg(parts)
     switch(
         msg$header$msg_type,
+        comm_info_request   = comm_manager$on_comm_info_request(msg),
+        comm_open           = comm_manager$on_comm_open(msg),
+        comm_msg            = comm_manager$on_comm_msg(msg),
+        comm_close          = comm_manager$on_comm_close(msg),
         execute_request     = executor$execute(msg),
         kernel_info_request = kernel_info(msg),
         history_request     = history(msg),
@@ -127,6 +132,43 @@ handle_shell = function() {
         is_complete_request = is_complete(msg),
         shutdown_request    = shutdown(msg),
         print(c('Got unhandled msg_type:', msg$header$msg_type)))
+},
+
+abort_shell_msg = function() {
+    "Send an abort message for an incoming shell request"
+    # See https://github.com/ipython/ipykernel/blob/1d97cb2a04149387a0d2dbea1b3d0af691d8df6c/ipykernel/kernelbase.py#L623
+
+    parts <- zmq.recv.multipart(sockets$shell, unserialize = FALSE)
+    msg <- wire_to_msg(parts)
+    log_debug('Aborting msg of type %s', msg$header$msg_type)
+    reply_type <- paste0(unlist(strsplit(msg$header$msg_type, '_'))[1], '_reply')
+    reply_content <- list(status = 'aborted')
+    send_response(reply_type, msg, 'shell', reply_content)
+    log_debug('Aborted msg')
+},
+
+abort_queued_messages = function() {
+    "Abort all already queued shell messages after an error"
+
+    log_debug('abort loop: aborted all outstanding msg')
+    while (TRUE) {
+        log_debug('abort loop: before poll')
+        ret <- zmq.poll(
+            c(sockets$shell), # only shell channel
+            c(.pbd_env$ZMQ.PO$POLLIN), # type
+            0) # zero timeout, only what's already there
+        log_debug('abort loop: after poll')
+        if(bitwAnd(zmq.poll.get.revents(1), .pbd_env$ZMQ.PO$POLLIN)) {
+            log_debug('abort loop: found msg')
+            abort_shell_msg()
+        } else {
+            # no more messages...
+            log_debug('abort loop: breaking')
+            break
+        }
+    }
+    log_debug('abort loop: end')
+
 },
 
 is_complete = function(request) {
@@ -227,9 +269,12 @@ kernel_info = function(request) {
 },
 
 handle_control = function() {
+    log_debug('Control: beginning')
     parts <- zmq.recv.multipart(sockets$control, unserialize = FALSE)
     msg <- wire_to_msg(parts)
+    log_debug('Control: recv msg of type %s', msg$header$msg_type)
     if (msg$header$msg_type == 'shutdown_request') {
+        log_debug('Control: shutdown...')
         shutdown(msg)
     } else {
         print(paste('Unhandled control message, msg_type:', msg$header$msg_type))
@@ -264,28 +309,54 @@ initialize = function(connection_file) {
     zmq.bind(sockets$control, url_with_port('control_port'))
     zmq.bind(sockets$stdin,   url_with_port('stdin_port'))
     zmq.bind(sockets$shell,   url_with_port('shell_port'))
-    
-    executor <<- Executor$new(send_response = .self$send_response)
+
+    executor <<- Executor$new(send_response = .self$send_response,
+        abort_queued_messages = .self$abort_queued_messages)
+    comm_manager <<- Comm_Manager$new(send_response = .self$send_response)
+    comm_manager_env$comm_manager <- comm_manager
 },
 
 run = function() {
+    options(jupyter.in_kernel = TRUE)
     while (TRUE) {
+        log_debug('main loop: beginning')
         zmq.poll(
             c(sockets$hb, sockets$shell, sockets$control),
             rep(.pbd_env$ZMQ.PO$POLLIN, 3))
-        
-        if(bitwAnd(zmq.poll.get.revents(1), .pbd_env$ZMQ.PO$POLLIN))
+        log_debug('main loop: after poll')
+
+        # It's important that these messages are handler one  by one in each
+        # look. The problem is that during the handler, a new zmq.poll could be
+        # done (and is done in case of errors in a execution request) and this
+        # invalidates the zmq.poll.get.revents call leading to "funny" results
+        # with found control message even if there are no control messages. So
+        # the easiest seems to be to handle this in a big if .. else if .. else
+        # clause...
+        # https://github.com/IRkernel/IRkernel/pull/266
+        if(bitwAnd(zmq.poll.get.revents(1), .pbd_env$ZMQ.PO$POLLIN)) {
+            log_debug('main loop: hb')
             hb_reply()
-        
-        if(bitwAnd(zmq.poll.get.revents(2), .pbd_env$ZMQ.PO$POLLIN))
+        } else if(bitwAnd(zmq.poll.get.revents(2), .pbd_env$ZMQ.PO$POLLIN)) {
+            log_debug('main loop: shell')
             handle_shell()
-        
-        if(bitwAnd(zmq.poll.get.revents(3), .pbd_env$ZMQ.PO$POLLIN))
+        } else if(bitwAnd(zmq.poll.get.revents(3), .pbd_env$ZMQ.PO$POLLIN)) {
+            log_debug('main loop: control')
             handle_control()
-        
+        } else {
+            # else shouldn't be possible
+            log_debug('main loop: zmq.poll returned but no message found?')
+        }
     }
+    log_debug('main loop: end')
 })
 )
+
+comm_manager_env <- new.env()
+#' Get global CommManager instance
+#'
+#' @return \link{CommManager} instance if a kernel is running, else NULL
+#' @export
+comm_manager <- function() comm_manager_env$comm_manager
 
 #' Initialise and run the kernel
 #'
@@ -297,7 +368,7 @@ main <- function(connection_file = '') {
         # On Windows, passing the connection file in as a string literal fails,
         # because the \U in C:\Users looks like a unicode escape. So, we have to
         # pass it as a separate command line argument.
-        connection_file = commandArgs(TRUE)[[1]]
+        connection_file <- commandArgs(TRUE)[[1]]
     }
     kernel <- Kernel$new(connection_file = connection_file)
     kernel$run()

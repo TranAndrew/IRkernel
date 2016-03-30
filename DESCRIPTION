@@ -2,7 +2,7 @@ Package: IRkernel
 Title: Native R kernel for the Jupyter notebook
 Description: This package provides a native interface to the R kernel from the
     Jupyter notebook
-Version: 0.5
+Version: 0.6
 Authors@R: c(person("Thomas", "Kluyver", role = c("aut", "cre"),
     email = "thomas@kluyver.me.uk"),
     person("Philipp", "A.", role = "aut",
@@ -21,11 +21,13 @@ Imports:
     methods,
     evaluate (>= 0.5.4),
     IRdisplay,
-    pbdZMQ (>= 0.2.1),
+    pbdZMQ (>= 0.2-1),
     jsonlite (>= 0.9.6),
     uuid,
     digest
 Collate:
+    'logging.r'
+    'comm_manager.r'
     'options.r'
     'execution.r'
     'help.r'

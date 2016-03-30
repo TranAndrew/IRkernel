@@ -62,12 +62,13 @@ format_stack <- function(calls) {
 Executor <- setRefClass(
     'Executor',
     fields = list(
-        send_response      = 'function',
-        execution_count    = 'integer',
-        payload            = 'list',
-        err                = 'list',
-        interrupted        = 'logical',
-        last_recorded_plot = 'recordedplotOrNULL'),
+        send_response         = 'function',
+        abort_queued_messages = 'function',
+        execution_count       = 'integer',
+        payload               = 'list',
+        err                   = 'list',
+        interrupted           = 'logical',
+        last_recorded_plot    = 'recordedplotOrNULL'),
     methods = list(
 
 execute = function(request) {
@@ -111,7 +112,7 @@ execute = function(request) {
     
     # .Last doesn’t seem to work, so replicating behavior
     quit <- function(save = 'default', status = 0, runLast = TRUE) {
-        save = switch(save,
+        save <- switch(save,
             default = , yes = TRUE,
             no = FALSE,
             ask = ask('Save workspace image? [y/n/c]: '),
@@ -147,6 +148,7 @@ execute = function(request) {
     
     err <<- list()
     nframe <- NULL  # find out stack depth in notebook cell
+
     tryCatch(evaluate(
         'stop()',
         stop_on_error = 1L,
@@ -157,8 +159,8 @@ execute = function(request) {
         
         msg <- paste0(toString(e), 'Traceback:\n')
         stack_info <- format_stack(calls)
-        
-        err <<- list(ename = 'ERROR', evalue = toString(e), traceback = c(msg, stack_info))
+
+        err <<- list(ename = 'ERROR', evalue = toString(e), traceback = as.list(c(msg, stack_info)))
         if (!silent) {
             send_response('error', request, 'iopub', c(err, list(
                 execution_count = execution_count)))
@@ -172,26 +174,57 @@ execute = function(request) {
         handle_message  <- identity
         handle_warning  <- identity
     } else {
+        handle_display_error <- function(e){
+            # This is used with withCallingHandler and only has two additional
+            # calls at the end instead of the 3 for tryCatch... (-2 at the end)
+            # we also remove the tryCatch and mime2repr stuff at the head of the callstack (+7)
+            calls <- head(sys.calls()[-seq_len(nframe + 7L)], -2)
+            stack_info <- format_stack(calls)
+            msg <- sprintf('ERROR while rich displaying an object: %s\nTraceback:\n%s\n',
+                           toString(e),
+                           paste(stack_info, collapse='\n'))
+            log_debug(msg)
+            if (!silent) {
+                send_response('stream', request, 'iopub', list(
+                    name = 'stderr',
+                    text = msg))
+            }
+        }
         handle_value <- function(obj) {
             data <- namedlist()
+            metadata <- namedlist()
+
             data[['text/plain']] <- repr_text(obj)
             
             # Only send a response when there is regular console output
             if (nchar(data[['text/plain']]) > 0) {
                 if (getOption('jupyter.rich_display')) {
-                    tryCatch({
-                        for (mime in getOption('jupyter.display_mimetypes')) {
+                    for (mime in getOption('jupyter.display_mimetypes')) {
+                        # Use withCallingHandlers as that shows the inner stacktrace:
+                        # https://stackoverflow.com/questions/15282471/get-stack-trace-on-trycatched-error-in-r
+                        # the tryCatch is  still needed to prevent the error from showing
+                        # up outside further up the stack :-/
+                        tryCatch(withCallingHandlers({
                             r <- mime2repr[[mime]](obj)
-                            if (!is.null(r)) data[[mime]] <- r
-                        }
-                    }, error = handle_error)
+                            if (!is.null(r)) {
+                                data[[mime]] <- r
+                                # Isolating full html pages (putting them in an iframe)
+                                if (identical(mime, 'text/html')) {
+                                    if (grepl('<html.*>', r, ignore.case = TRUE)) {
+                                        log_debug('Found full html page: %s', strtrim(r, 100))
+                                        metadata[[mime]] <- list(isolated = TRUE)
+                                    }
+                                }
+                            }
+                        }, error = handle_display_error),
+                        error = function(x) {})
+                    }
                 }
-                
-                send_response('execute_result', request, 'iopub', list(
-                    data = data,
-                    metadata = namedlist(),
-                    execution_count = execution_count))
             }
+            log_debug("Sending display_data: %s", paste(capture.output(str(data)), collapse = "\n"))
+            send_response('display_data', request, 'iopub', list(
+                data = data,
+                metadata = metadata))
         }
         
         stream <- function(output, streamname) {
@@ -211,7 +244,7 @@ execute = function(request) {
             stream(paste(o$message, collapse = ''), 'stderr')
         }
         
-        handle_warning = function(o) {
+        handle_warning <- function(o) {
             call <- if (is.null(o$call)) '' else paste('In', deparse(o$call)[[1]])
             stream(sprintf('Warning message:\n%s: %s', call, o$message), 'stderr')
         }
@@ -259,7 +292,13 @@ execute = function(request) {
     }
     
     send_response('execute_reply', request, 'shell', reply_content)
-    
+
+    if (interrupted || !is.null(err$ename)) {
+        # errors or interrupts should interrupt all currently queued messages,
+        # not only the currently running one...
+        abort_queued_messages()
+    }
+
     if (!silent) {
         execution_count <<- execution_count + 1L
     }
